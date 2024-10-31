@@ -1,0 +1,153 @@
+let isValid = true;
+/**
+ * Query zone
+ */
+let query = await TBSheetUtils.query(`select "gender" from "user" where "username" = '${input.username}'`)
+const gender = query[0].gender;
+
+/**
+ * Task Performing Zone
+ */
+
+// First we need to check if the one-time-only leave has been already used (ordination + marraige)
+let firstCheck = await TBSheetUtils.query(`
+  select "usedDummy" from "remainingLeave" where "typeID" = '${input.leaveType}' and "username" = '${input.username}'
+`)
+if(firstCheck[0].usedDummy === 'yes'){
+  isValid = false;
+} else{
+  isValid = true;
+}
+
+// Insert leaveRequest table (if isValid = true)
+if(isValid == true){
+let insert = await TBSheetUtils.query(`
+  insert into "leaveRequest"
+  (
+    "username",
+    "typeID",
+    "startDate",
+    "endDate",
+    "startTime",
+    "endTime",
+    "leaveDetail",
+    "submittedTime"
+  )
+  values(
+    '${input.username}',
+    '${input.leaveType}',
+    '${input.startDate}',
+    '${input.endDate}',
+    '${input.startTime}',
+    '${input.endTime}',
+    :leaveDetail,
+    current_timestamp
+  )
+  returning id
+`, {leaveDetail:input.leaveDetail});
+
+if(input.attachedFile != ""){
+// Upload photo to S3
+let newURL = await PluginsUtils.Storage.uploadFile({ mode: 'public', sourceUrl: input.attachedFile})
+// // Update photo into TBBase
+await SheetDB("leaveRequest").update({"attachedFile":newURL}).where("id","=",insert[0].id)
+}
+
+let key = "LID" + insert[0].id.toString().padStart(6, '0');
+// Update the primary key 
+await SheetDB("leaveRequest").update({"leaveID":key}).where("id","=",insert[0].id);
+// Update into requestStatus
+await SheetDB("leaveStatus").insert({"leaveID":key, "leaveStatus":'pending'});
+
+
+// Update the remaining balance
+// SQL statement
+let result = await TBSheetUtils.query(sqlCode,input); 
+
+// remaining leave
+const avaiDays =  result[0].remainingDays;
+const avaiHours = result[0].remainingHours;
+
+// used leave
+const usedDays0 = result[0].usedDays;
+const usedHours0 = result[0].usedHours;
+
+/**
+ * Condition of leave
+ */
+// ordination (male) or maternity (female)
+let leaveDays = 0;
+let leaveHours = 0;
+
+if((input.leaveType === 'LEAVE0004' && gender === 'male') || (input.leaveType === 'LEAVE0005' && gender === 'female')){
+  let callFunction_calculateLeave_includeHoiday = await PluginsUtils.Local.callFunction('calculateLeave_includeHoliday',{"startDate":input.startDate,"endDate":input.endDate,"startTime":input.startTime, "endTime":input.endTime});
+
+  leaveDays = callFunction_calculateLeave_includeHoiday.resultData.days;
+  leaveHours = callFunction_calculateLeave_includeHoiday.resultData.hours;
+}
+else{
+// other type of leaves
+  let callFunction_calculateLeave = await PluginsUtils.Local.callFunction('calculateLeave_skipHoliday',{"startDate":input.startDate,"endDate":input.endDate,"startTime":input.startTime, "endTime":input.endTime});
+
+  leaveDays = callFunction_calculateLeave.resultData.days
+  leaveHours = callFunction_calculateLeave.resultData.hours
+}
+console.log(leaveDays+' days '+leaveHours+ ' hours');
+//Update the calculated leave days and hours to leaveRequest table.
+await SheetDB("leaveRequest").update({"leaveDays":leaveDays,"leaveHours":leaveHours}).where("id","=",insert[0].id);
+
+/**
+ * Computation
+ */
+// calculate the remaining leave
+let callFunction_subtractTime = await PluginsUtils.Local.callFunction('subtractTime',{"day":avaiDays,"hour":avaiHours,"subtractDay":leaveDays,"subtractHour":leaveHours});
+
+const remainingDays = callFunction_subtractTime.resultData.days;
+const remainingHours = callFunction_subtractTime.resultData.hours;
+
+//calculate the used leave
+let callFunction_addTime = await PluginsUtils.Local.callFunction('addTime',{"day":usedDays0,"hour":usedHours0,"addDay":leaveDays,"addHour":leaveHours});
+
+const usedDays1 = callFunction_addTime.resultData.days
+const usedHours1 = callFunction_addTime.resultData.hours
+console.log(usedDays1+' days '+usedHours1+' hours');
+
+
+// Update the remaining leave and used leave
+if(input.leaveType === 'LEAVE0004' || input.leaveType === 'LEAVE0006'){
+await TBSheetUtils.query(`
+  update "remainingLeave"
+  set 
+    "remainingDays" = '${remainingDays}',
+    "remainingHours" = '${remainingHours}',
+    "usedDays" = '${usedDays1}',
+    "usedHours" = '${usedHours1}',
+    "usedDummy" = 'yes'
+  where
+    "username" = '${input.username}'
+    and
+    "typeID" = '${input.leaveType}'
+`)}
+else{
+  await TBSheetUtils.query(`
+  update "remainingLeave"
+  set 
+    "remainingDays" = '${remainingDays}',
+    "remainingHours" = '${remainingHours}',
+    "usedDays" = '${usedDays1}',
+    "usedHours" = '${usedHours1}'
+  where
+    "username" = '${input.username}'
+    and
+    "typeID" = '${input.leaveType}'
+  `)
+}
+/**
+* Output structure Zone
+*/
+output.resultData = result[0] || {};
+}
+else{
+  output.resultSuccess = isValid;
+  output.resultMessage = 'This type of leave can be used one time only. You have already used this.'
+}
